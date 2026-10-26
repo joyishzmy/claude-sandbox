@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/common.sh
+. "$HERE/scripts/common.sh"
+
+usage() {
+  cat <<'EOF'
+claude-sandbox — an isolated US-region workspace for Claude Code and other CLI tools
+
+Usage: ./sandbox [command] [args]
+
+  up                 start the gateway and workspace
+  down               stop both containers
+  shell              enter the sandbox (default); starts the stack if needed
+  build | rebuild    build the image (rebuild ignores Docker's cache)
+  refresh            reload US nodes from Clash Verge, honoring the pinned node
+  nodes              list available US node names from the current Verge profile
+  pin "NODE NAME"    pin one node for a stable exit IP
+  pin --auto         resume automatic selection among US nodes
+  import FILE.yaml   import nodes from a Clash/mihomo YAML file
+  install-claude     install Claude Code into the persistent sandbox home
+  verify             check timezone, locale, DNS, and US egress
+  verify --kill-switch
+                     additionally prove that gateway failure causes no IP leak
+  watch [start|stop|status|once|run]
+                     English-only file monitor (start = background daemon)
+  logs               follow gateway logs
+  doctor             local configuration and runtime diagnostics
+  version            print the sandbox version
+
+State, nodes, and Claude credentials live in state/ and are never committed.
+EOF
+}
+
+start_stack() {
+  sandbox_ensure_docker
+  sandbox_require_nodes
+  mkdir -p "$SANDBOX_WORKSPACE" "$SANDBOX_STATE_DIR/home" "$SANDBOX_STATE_DIR/gateway"
+  chmod 700 "$SANDBOX_STATE_DIR" "$SANDBOX_STATE_DIR/home" "$SANDBOX_STATE_DIR/gateway"
+  sandbox_compose up -d
+}
+
+refresh_nodes() {
+  sandbox_ensure_docker
+  local verge
+  if ! verge="$(sandbox_verge_dir)"; then
+    cat >&2 <<'EOF'
+Clash Verge Rev was not found. Select a subscription in Verge first, set
+SANDBOX_VERGE_DIR in .env, or use ./sandbox import /path/to/config.yaml.
+EOF
+    return 1
+  fi
+  sandbox_node_runner "$verge" refresh
+  if docker ps --format '{{.Names}}' | grep -qx "$SANDBOX_GATEWAY"; then
+    docker restart "$SANDBOX_GATEWAY" >/dev/null
+    sleep 3
+    docker restart "$SANDBOX_CONTAINER" >/dev/null 2>&1 || true
+    echo "Gateway and workspace restarted."
+  fi
+}
+
+import_nodes() {
+  local file="$1"
+  [ -f "$file" ] || { echo "File not found: $file" >&2; return 1; }
+  file="$(sandbox_abspath "$file")"
+  sandbox_ensure_docker
+  sandbox_node_runner "$(dirname "$file")" refresh --from-file "/host-verge/$(basename "$file")"
+  if docker ps --format '{{.Names}}' | grep -qx "$SANDBOX_GATEWAY"; then
+    docker restart "$SANDBOX_GATEWAY" >/dev/null
+    sleep 3
+    docker restart "$SANDBOX_CONTAINER" >/dev/null 2>&1 || true
+  fi
+}
+
+watch_workspace() {
+  local action="${1:-start}"
+  local pidfile="$SANDBOX_STATE_DIR/langwatch.pid"
+  local logfile="$SANDBOX_STATE_DIR/langwatch.log"
+  mkdir -p "$SANDBOX_STATE_DIR"
+  case "$action" in
+    start)
+      if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        echo "langwatch already running (pid $(cat "$pidfile"))"
+        return 0
+      fi
+      nohup python3 "$HERE/scripts/langwatch.py" "$SANDBOX_WORKSPACE" >> "$logfile" 2>&1 &
+      echo $! > "$pidfile"
+      echo "Watching $SANDBOX_WORKSPACE (pid $(cat "$pidfile"), log: $logfile)"
+      ;;
+    stop)
+      if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        kill "$(cat "$pidfile")"
+        echo "Stopped $(cat "$pidfile")"
+      else
+        echo "langwatch is not running"
+      fi
+      rm -f "$pidfile"
+      ;;
+    status)
+      if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        echo "running (pid $(cat "$pidfile"))"
+      else
+        echo "not running"
+      fi
+      ;;
+    once)
+      python3 "$HERE/scripts/langwatch.py" "$SANDBOX_WORKSPACE" --once
+      ;;
+    run)
+      python3 "$HERE/scripts/langwatch.py" "$SANDBOX_WORKSPACE"
+      ;;
+    *)
+      echo "usage: ./sandbox watch [start|stop|status|once|run]" >&2
+      return 1
+      ;;
+  esac
+}
+
+command="${1:-shell}"
+case "$command" in
+  up) start_stack ;;
+  down) sandbox_compose down ;;
+  restart) sandbox_compose down && start_stack ;;
+  build) sandbox_ensure_docker && sandbox_compose build ;;
+  rebuild) sandbox_ensure_docker && sandbox_compose build --no-cache ;;
+  shell)
+    if ! docker exec -it -u "$SANDBOX_UID:$SANDBOX_GID" "$SANDBOX_CONTAINER" bash -l 2>/dev/null; then
+      start_stack
+      sleep 2
+      docker exec -it -u "$SANDBOX_UID:$SANDBOX_GID" "$SANDBOX_CONTAINER" bash -l
+    fi
+    ;;
+  refresh) refresh_nodes ;;
+  nodes)
+    sandbox_ensure_docker
+    verge="$(sandbox_verge_dir)" || { echo "Clash Verge Rev not found; see ./sandbox import." >&2; exit 1; }
+    sandbox_node_runner "$verge" list
+    ;;
+  pin)
+    mkdir -p "$SANDBOX_STATE_DIR"
+    if [ "${2:-}" = "--auto" ]; then
+      rm -f "$SANDBOX_STATE_DIR/pinned-node"
+      echo "Automatic node selection enabled."
+    elif [ -n "${2:-}" ]; then
+      printf '%s' "$2" > "$SANDBOX_STATE_DIR/pinned-node"
+      echo "Pinned node: $2"
+    else
+      if [ -f "$SANDBOX_STATE_DIR/pinned-node" ]; then
+        printf 'Pinned node: '; cat "$SANDBOX_STATE_DIR/pinned-node"; echo
+      else
+        echo "Automatic node selection (no pinned node)."
+      fi
+      exit 0
+    fi
+    refresh_nodes
+    ;;
+  import)
+    [ $# -ge 2 ] || { echo "usage: ./sandbox import FILE.yaml" >&2; exit 1; }
+    import_nodes "$2"
+    ;;
+  install-claude)
+    start_stack
+    docker exec -u "$SANDBOX_UID:$SANDBOX_GID" "$SANDBOX_CONTAINER" bash -lc \
+      'if ! command -v claude >/dev/null; then curl -fsSL https://claude.ai/install.sh | bash; fi; claude --version'
+    ;;
+  verify)
+    shift || true
+    bash "$HERE/scripts/verify.sh" "$@"
+    ;;
+  watch) shift || true; watch_workspace "${1:-start}" ;;
+  logs) docker logs -f "$SANDBOX_GATEWAY" ;;
+  doctor)
+    echo "Platform: $(sandbox_platform)"
+    echo "Workspace: $SANDBOX_WORKSPACE"
+    echo "State: $SANDBOX_STATE_DIR"
+    echo "UID:GID: $SANDBOX_UID:$SANDBOX_GID"
+    if verge="$(sandbox_verge_dir)"; then echo "Clash Verge: $verge"; else echo "Clash Verge: not found (use import)"; fi
+    docker ps --format '{{.Names}}  {{.Status}}' | grep -E 'sandbox-(gateway|workspace)' || true
+    bash "$HERE/scripts/verify.sh"
+    ;;
+  version) echo "claude-sandbox 1.0.0" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

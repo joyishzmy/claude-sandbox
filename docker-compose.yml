@@ -1,0 +1,48 @@
+name: claude-sandbox
+
+services:
+  gateway:
+    image: metacubex/mihomo:v1.19.32
+    container_name: sandbox-gateway
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./gateway/config.yaml:/root/.config/mihomo/config.yaml:ro
+      - ${SANDBOX_STATE_DIR:-./state}/gateway/proxies.yaml:/root/.config/mihomo/proxies.yaml:ro
+
+  workspace:
+    build:
+      context: ./image
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+    image: claude-sandbox:latest
+    container_name: sandbox-workspace
+    restart: unless-stopped
+    # No independent network interface: every packet must cross the gateway.
+    network_mode: container:sandbox-gateway
+    depends_on:
+      - gateway
+    cap_drop:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_MODULE
+      - BPF
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${SANDBOX_TZ:-America/Los_Angeles}
+      LANG: ${SANDBOX_LOCALE:-en_US.UTF-8}
+      LC_ALL: ${SANDBOX_LOCALE:-en_US.UTF-8}
+      LANGUAGE: en_US:en
+      SANDBOX_UID: ${SANDBOX_UID:-1000}
+      SANDBOX_GID: ${SANDBOX_GID:-1000}
+    volumes:
+      - ${SANDBOX_WORKSPACE:-./workspace}:/workspace
+      - ${SANDBOX_STATE_DIR:-./state}/home:/home/sandbox
+    working_dir: /workspace
+    tty: true
+    stdin_open: true

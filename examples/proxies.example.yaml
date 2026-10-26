@@ -1,0 +1,11 @@
+# Example only: replace every placeholder with your own node configuration.
+# Save as state/gateway/proxies.yaml, or use ./sandbox import your-config.yaml.
+# Do not commit real subscription URLs, passwords, UUIDs, or private keys.
+proxies:
+  - name: "US-example"
+    type: ss
+    server: us-node.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: REPLACE_ME
+    udp: true

@@ -1,0 +1,58 @@
+log-level: warning
+mode: rule
+mixed-port: 7890
+allow-lan: false
+ipv6: false
+unified-delay: true
+
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '+.local'
+  # Only used to resolve proxy server hostnames and bootstrap DNS.
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  nameserver:
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+
+tun:
+  enable: true
+  stack: system
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+
+proxy-providers:
+  nodes:
+    type: file
+    path: /root/.config/mihomo/proxies.yaml
+    health-check:
+      enable: true
+      # Do not use gstatic here: in some networks it resolves to a domestic
+      # address, which makes every healthy node look dead through the tunnel.
+      url: http://cp.cloudflare.com/generate_204
+      interval: 120
+
+proxy-groups:
+  - name: US
+    type: url-test
+    use:
+      - nodes
+    filter: '美国|西美|🇺🇸|(?i)(^|[^a-z])us([^a-z]|$)|united states'
+    url: http://cp.cloudflare.com/generate_204
+    interval: 120
+    tolerance: 100
+
+# One catch-all rule. There is intentionally no DIRECT or domestic bypass.
+rules:
+  - MATCH,US
