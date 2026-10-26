@@ -34,11 +34,17 @@ echo "== DNS =="
 getent hosts www.google.com || { echo "FAIL: DNS resolution failed"; fail=1; }
 echo
 echo "== egress =="
-json="$(curl -fsS --max-time 12 https://ipinfo.io/json)" || fail=1
+json=""
+if ! json="$(curl -fsS --max-time 12 https://ipinfo.io/json)"; then
+  # The primary free geo API can rate-limit; use an independent HTTPS source.
+  if ! json="$(curl -fsS --max-time 12 https://ipwho.is/)"; then
+    fail=1
+  fi
+fi
 if [ -n "${json:-}" ]; then
   echo "$json"
-  country="$(printf "%s" "$json" | jq -r ".country // empty")"
-  ip_timezone="$(printf "%s" "$json" | jq -r ".timezone // empty")"
+  country="$(printf "%s" "$json" | jq -r ".country // .country_code // empty")"
+  ip_timezone="$(printf "%s" "$json" | jq -r ".timezone.id? // .timezone? // empty")"
   echo "Country: $country | IP timezone: $ip_timezone"
   [ "$country" = "US" ] || { echo "FAIL: egress is not in the US"; fail=1; }
 else
